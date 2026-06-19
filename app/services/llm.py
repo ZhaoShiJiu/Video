@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import requests
 from typing import List
@@ -1089,6 +1090,332 @@ def generate_social_metadata(
     return _fallback_social_metadata(video_subject, video_script, platform)
 
 
+# =============================================================================
+# AI Image Tagging — Vision API integration
+# =============================================================================
+
+# Closed-enumeration candidate lists for Crayon Shin-chan screenshots
+_CHARACTER_CANDIDATES = {
+    "野原新之助": "主角，5岁小男孩",
+    "野原美冴": "小新的妈妈，家庭主妇",
+    "野原广志": "小新的爸爸，上班族",
+    "野原向日葵": "小新的妹妹，婴儿",
+    "小白": "野原家的宠物狗（棉花糖）",
+    "风间彻": "小新的同学，优等生",
+    "樱田妮妮": "小新的同学，性格强势",
+    "佐藤正男": "小新的同学，胆小",
+    "阿呆": "小新的同学，沉默寡言",
+    "酢乙女爱": "小新的同学，富家女",
+    "松坂老师": "玫瑰班老师",
+    "吉永老师": "向日葵班老师",
+    "园长": "幼稚园园长",
+    "其他": "不在以上列表中的角色",
+}
+
+_EMOTION_CANDIDATES = [
+    "开心", "大笑", "兴奋", "得意", "害羞", "生气", "愤怒",
+    "哭泣", "委屈", "害怕", "紧张", "震惊", "无语", "尴尬",
+    "色眯眯", "搞怪", "平静",
+]
+
+_EVENT_CATEGORIES = {
+    "家庭日常": ["吃饭", "睡觉", "洗澡", "看电视", "聊天", "做家务"],
+    "搞笑冲突": ["被妈妈骂", "恶作剧", "捣乱", "偷吃零食", "逃跑", "打闹", "吵架"],
+    "学校朋友": ["上学", "上课", "玩耍", "比赛"],
+    "其他": ["跳舞", "唱歌", "旅行", "冒险", "无明显事件"],
+}
+
+# Build character list string for prompt
+_CHARACTER_LIST_STR = "\n".join(f"- {name}" for name in _CHARACTER_CANDIDATES)
+
+# Build emotion list string for prompt
+_EMOTION_LIST_STR = "\n".join(f"- {e}" for e in _EMOTION_CANDIDATES)
+
+# Build event list string for prompt (with category groups)
+_EVENT_LIST_PARTS = []
+for _category, _events in _EVENT_CATEGORIES.items():
+    _EVENT_LIST_PARTS.append(f"\n{_category}：")
+    for _evt in _events:
+        _EVENT_LIST_PARTS.append(f"- {_evt}")
+_EVENT_LIST_STR = "\n".join(_EVENT_LIST_PARTS)
+
+TAGGING_SYSTEM_PROMPT = f"""你是一名专业的《蜡笔小新》动画素材分析助手。
+
+你的任务是仔细分析输入图片中的角色、情绪、剧情事件和视觉元素，并严格按照指定 JSON 格式返回结果。
+
+要求：
+
+1. characters:
+识别图片中出现的主要角色。
+允许多个角色。
+只能从以下角色列表中选择，不允许创造新的角色名称：
+
+{_CHARACTER_LIST_STR}
+
+2. emotions:
+分析角色当前表达的情绪和心理状态。
+允许多个情绪。
+只能从以下情绪列表中选择：
+
+{_EMOTION_LIST_STR}
+
+如果无法明确判断，选择"平静"。
+
+3. events:
+分析当前画面正在发生的剧情事件。
+允许多个事件。
+只能从以下事件列表中选择：
+{_EVENT_LIST_STR}
+
+如果图片是静态人物，没有明显行为，则选择"无明显事件"。
+
+4. description:
+用一句简洁的中文描述整个画面，长度控制在 50 字以内。
+描述中应包含：
+- 主要角色
+- 主要动作或事件
+- 关键情绪
+
+例如：
+"小新偷吃布丁被美冴发现，露出震惊和害怕的表情。"
+
+5. colors:
+识别画面中的 2~5 个主要颜色。
+使用中文颜色名称，例如：
+红色、黄色、蓝色、绿色、黑色、白色、橙色、粉色。
+
+返回格式必须严格符合以下 JSON Schema：
+
+{{
+  "characters": [],
+  "emotions": [],
+  "events": [],
+  "description": "",
+  "colors": []
+}}
+
+重要规则：
+- 只能返回 JSON，不允许输出解释、注释或 Markdown。
+- 不允许添加 JSON Schema 中不存在的字段。
+- 数组必须使用 JSON 数组格式。
+- 如果无法识别某项内容，返回空数组或合理默认值。
+- 所有文本必须使用简体中文。"""
+
+
+def _prepare_image(image_path: str, max_long_edge: int = 2048) -> str:
+    """
+    Read image → resize → encode as base64 data URI.
+
+    - Resize long edge to max_long_edge (maintaining aspect ratio)
+    - Convert to RGB (remove alpha channel)
+    - JPEG quality 85%
+    - Return "data:image/jpeg;base64,xxxx"
+    """
+    import base64
+    import io
+
+    try:
+        from PIL import Image
+    except ImportError:
+        raise ImportError(
+            "Pillow is required for image tagging. Install with: pip install Pillow"
+        )
+
+    with Image.open(image_path) as img:
+        # Convert to RGB (remove alpha channel)
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+        elif img.mode == "L":
+            img = img.convert("RGB")
+
+        # Resize long edge if needed
+        w, h = img.size
+        max_edge = max(w, h)
+        if max_edge > max_long_edge:
+            scale = max_long_edge / max_edge
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+
+        # Encode as JPEG base64
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        img_bytes = buf.getvalue()
+
+    encoded = base64.b64encode(img_bytes).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def _parse_tags_json(raw: str) -> dict:
+    """
+    Fault-tolerant JSON parsing for Vision LLM response.
+
+    Handles cases where the model wraps JSON in markdown code fences
+    or includes extra text.
+    """
+    if raw is None:
+        raw = ""
+
+    raw = raw.strip()
+
+    # Try direct parse
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Try extracting ```json ... ``` code fence
+    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", raw, re.DOTALL)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    # Try extracting the first complete JSON object
+    # Use a stack-based approach to find balanced braces
+    start_idx = raw.find("{")
+    if start_idx >= 0:
+        depth = 0
+        for i in range(start_idx, len(raw)):
+            if raw[i] == "{":
+                depth += 1
+            elif raw[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(raw[start_idx : i + 1])
+                    except json.JSONDecodeError:
+                        break
+
+    # Final fallback: return empty tags
+    logger.error(f"Failed to parse Vision LLM JSON response: {raw[:200]}")
+    return {
+        "characters": [],
+        "emotions": ["平静"],
+        "events": ["无明显事件"],
+        "description": "",
+        "colors": [],
+    }
+
+
+def analyze_image(image_path: str) -> dict:
+    """
+    Analyze a Crayon Shin-chan screenshot using Qwen3-VL-Flash (OpenAI compatible).
+
+    Returns a dict with keys: characters, emotions, events, description, colors.
+    """
+    import base64
+
+    from app.config import config as _cfg
+
+    # 1. Check if tagging is enabled
+    if not _cfg.tagging.get("enabled", True):
+        raise RuntimeError(
+            "Image tagging is disabled. Set [tagging] enabled = true in config.toml"
+        )
+
+    # 2. Check file size limit
+    max_size_mb = _cfg.tagging.get("max_file_size_mb", 20)
+    file_size = os.path.getsize(image_path)
+    if file_size > max_size_mb * 1024 * 1024:
+        raise ValueError(
+            f"Image file size ({file_size / 1024 / 1024:.1f}MB) exceeds limit ({max_size_mb}MB)"
+        )
+
+    # 3. Prepare the image
+    max_edge = _cfg.tagging.get("max_image_long_edge", 2048)
+    image_data_uri = _prepare_image(image_path, max_long_edge=max_edge)
+
+    # 4. Build OpenAI compatible client
+    api_key = _cfg.tagging.get("vision_api_key_override", "").strip()
+    if not api_key:
+        api_key = _cfg.app.get("qwen_api_key", "")
+    if not api_key:
+        raise ValueError(
+            "No API key configured for image tagging. "
+            "Set qwen_api_key in [app] or vision_api_key_override in [tagging]."
+        )
+
+    base_url = _cfg.tagging.get(
+        "vision_base_url",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
+    model_name = _cfg.tagging.get("vision_model", "qwen3-vl-flash")
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+    )
+
+    # 5. Construct multimodal message
+    messages = [
+        {"role": "system", "content": TAGGING_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": image_data_uri}},
+            ],
+        },
+    ]
+
+    # 6. Call API with retries for rate limiting
+    _max_tag_retries = 3
+    for attempt in range(_max_tag_retries):
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=500,
+                timeout=60,
+            )
+            raw = response.choices[0].message.content
+            result = _parse_tags_json(raw)
+            logger.debug(f"Image analysis result for {os.path.basename(image_path)}: {result}")
+            return result
+        except Exception as e:
+            error_str = str(e).lower()
+            if "429" in error_str and attempt < _max_tag_retries - 1:
+                wait_time = [3, 10, 30][attempt]
+                logger.warning(
+                    f"Rate limited during image analysis (attempt {attempt + 1}/{_max_tag_retries}), "
+                    f"waiting {wait_time}s..."
+                )
+                import time as _time
+
+                _time.sleep(wait_time)
+                continue
+            if "401" in error_str or "403" in error_str:
+                raise ValueError(
+                    f"API authentication failed: {e}. "
+                    "Please check your qwen_api_key in config.toml."
+                )
+            if attempt < _max_tag_retries - 1:
+                logger.warning(
+                    f"Image analysis failed (attempt {attempt + 1}/{_max_tag_retries}): {e}"
+                )
+                import time as _time
+
+                _time.sleep(1)
+                continue
+            raise
+
+
+# Expose candidate lists for WebUI filtering
+def get_tag_candidates() -> dict:
+    """Return the closed-enumeration candidate lists for the WebUI."""
+    all_events = []
+    for _cat, _evts in _EVENT_CATEGORIES.items():
+        all_events.extend(_evts)
+
+    return {
+        "characters": list(_CHARACTER_CANDIDATES.keys()),
+        "emotions": _EMOTION_CANDIDATES,
+        "events": all_events,
+    }
+
+
 if __name__ == "__main__":
     video_subject = "生命的意义是什么"
     script = generate_script(
@@ -1101,4 +1428,4 @@ if __name__ == "__main__":
     )
     print("######################")
     print(search_terms)
-    
+

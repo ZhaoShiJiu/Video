@@ -152,6 +152,7 @@ def save_config():
         _cfg["app"] = app
         _cfg["azure"] = azure
         _cfg["siliconflow"] = siliconflow
+        _cfg["tagging"] = tagging
         _cfg["ui"] = ui
         f.write(toml.dumps(_cfg))
 
@@ -168,6 +169,7 @@ ui = _cfg.get(
         "hide_log": False,
     },
 )
+tagging = _cfg.get("tagging", {})
 
 # Normalize material_directory path: the third-party "toml" library may
 # incorrectly interpret backslash sequences like \v (vertical tab) in Windows

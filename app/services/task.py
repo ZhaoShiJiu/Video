@@ -181,6 +181,48 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
                 "no valid materials found, please check the materials and try again."
             )
             return None
+
+        # Tag-based material matching: if enabled and tagged images exist,
+        # augment the material list with relevance-matched images
+        if params.match_materials_to_script and config.tagging.get("enabled", True):
+            try:
+                from app.services import tagging
+
+                _mat_dir = config.app.get("material_directory", "").strip()
+                if not _mat_dir:
+                    _mat_dir = utils.storage_dir("local_videos", create=True)
+
+                script = getattr(params, "video_script", "") or ""
+                if script and os.path.isdir(_mat_dir):
+                    tagged_paths = tagging.match_materials_by_tags(
+                        script_text=script,
+                        tagged_dir=_mat_dir,
+                        top_k=10,
+                    )
+                    if tagged_paths:
+                        from app.models.schema import MaterialInfo
+
+                        _mat_dir_resolved = _mat_dir
+                        for tp in tagged_paths:
+                            # Build full path
+                            if os.path.isabs(tp):
+                                full = tp
+                            else:
+                                full = os.path.join(_mat_dir_resolved, tp)
+                            if os.path.isfile(full) and full not in [
+                                m.url for m in materials
+                            ]:
+                                mi = MaterialInfo()
+                                mi.provider = "local"
+                                mi.url = tp  # relative path
+                                mi.duration = 0
+                                materials.append(mi)
+                        logger.info(
+                            f"Tag-based matching added {len(tagged_paths)} relevant materials"
+                        )
+            except Exception as e:
+                logger.warning(f"Tag-based material matching failed: {e}")
+
         return [material_info.url for material_info in materials]
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")

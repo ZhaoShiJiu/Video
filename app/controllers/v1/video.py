@@ -2,7 +2,7 @@ import glob
 import os
 import pathlib
 import shutil
-from typing import Union
+from typing import Optional, Union
 
 from fastapi import BackgroundTasks, Depends, Path, Query, Request, UploadFile
 from fastapi.params import File
@@ -415,3 +415,259 @@ async def download_video(request: Request, file_path: str):
         filename=f"{filename}{extension}",
         media_type=f"video/{extension[1:]}",
     )
+
+
+# =============================================================================
+# AI Image Tagging API
+# =============================================================================
+
+from app.models.schema import (
+    ImageTags,
+    TagDeleteRequest,
+    TagGenerateRequest,
+)
+from app.services import tagging
+
+
+def _get_material_dir() -> str:
+    """Get the configured material directory for tagging operations."""
+    _material_dir = config.app.get("material_directory", "").strip()
+    if _material_dir:
+        base_dir = _material_dir
+    else:
+        base_dir = utils.storage_dir("local_videos", create=True)
+    return base_dir
+
+
+def _normalize_material_path(base_dir: str, file_path: str) -> str:
+    """Resolve a file path relative to the material directory."""
+    if os.path.isabs(file_path):
+        fp = file_path
+    else:
+        fp = os.path.join(base_dir, file_path)
+    fp = os.path.normpath(fp)
+    if not os.path.isfile(fp):
+        raise HttpException(
+            task_id="",
+            status_code=404,
+            message=f"File not found: {file_path}",
+        )
+    return fp
+
+
+@router.get(
+    "/materials/tags",
+    summary="Get tag statistics overview",
+)
+def get_tag_statistics(request: Request):
+    base_dir = _get_material_dir()
+    try:
+        stats = tagging.get_tag_statistics(base_dir)
+        return utils.get_response(200, stats)
+    except Exception as e:
+        logger.error(f"Failed to get tag statistics: {e}")
+        raise HttpException(
+            task_id="",
+            status_code=500,
+            message=f"Failed to get tag statistics: {str(e)}",
+        )
+
+
+@router.post(
+    "/materials/tags/generate",
+    summary="Trigger batch image tagging",
+)
+def trigger_batch_tagging(
+    background_tasks: BackgroundTasks,
+    request: Request,
+    body: TagGenerateRequest,
+):
+    task_id = utils.get_uuid()
+    base_dir = _get_material_dir()
+
+    logger.info(
+        f"Starting batch tagging: task_id={task_id}, force={body.force}, "
+        f"max_concurrent={body.max_concurrent}"
+    )
+
+    # Check if tagging is enabled
+    if not config.tagging.get("enabled", True):
+        raise HttpException(
+            task_id=task_id,
+            status_code=400,
+            message="Image tagging is disabled. Set [tagging] enabled = true in config.toml",
+        )
+
+    # Check if API key is configured
+    api_key = config.tagging.get("vision_api_key_override", "").strip()
+    if not api_key:
+        api_key = config.app.get("qwen_api_key", "")
+    if not api_key:
+        raise HttpException(
+            task_id=task_id,
+            status_code=400,
+            message="No API key configured. Set qwen_api_key in [app] or vision_api_key_override in [tagging].",
+        )
+
+    # Initialize task state
+    from app.models import const
+
+    sm.state.update_task(
+        task_id,
+        state=const.TASK_STATE_PROCESSING,
+        progress=0,
+        total=0,
+        tagged=0,
+        skipped=0,
+        failed=0,
+        current_file="",
+        errors=[],
+    )
+
+    # Run batch tagging in background
+    background_tasks.add_task(
+        tagging.batch_tag_images,
+        base_dir=base_dir,
+        force=body.force,
+        max_concurrent=body.max_concurrent,
+        task_id=task_id,
+    )
+
+    return utils.get_response(
+        200,
+        {
+            "task_id": task_id,
+        },
+        "Tagging task started",
+    )
+
+
+@router.get(
+    "/materials/tags/status",
+    summary="Query batch tagging progress",
+)
+def get_tagging_status(
+    request: Request,
+    task_id: str = Query(..., description="Task ID from /materials/tags/generate"),
+):
+    task = sm.state.get_task(task_id)
+    if task:
+        return utils.get_response(200, task)
+
+    raise HttpException(
+        task_id=task_id,
+        status_code=404,
+        message="Task not found",
+    )
+
+
+@router.get(
+    "/materials/tags/search",
+    summary="Search materials by tags",
+)
+def search_materials(
+    request: Request,
+    characters: Optional[str] = Query(None, description="Comma-separated character names"),
+    emotions: Optional[str] = Query(None, description="Comma-separated emotion names"),
+    events: Optional[str] = Query(None, description="Comma-separated event names"),
+    keyword: Optional[str] = Query(None, description="Fuzzy search in description"),
+    match: str = Query("any", description="Match mode: 'any' or 'all'"),
+    limit: int = Query(20, ge=1, le=100, description="Max results to return"),
+):
+    base_dir = _get_material_dir()
+
+    # Parse comma-separated parameters
+    char_list = [c.strip() for c in characters.split(",") if c.strip()] if characters else None
+    emo_list = [e.strip() for e in emotions.split(",") if e.strip()] if emotions else None
+    evt_list = [e.strip() for e in events.split(",") if e.strip()] if events else None
+    kw = keyword.strip() if keyword else None
+
+    if match not in ("any", "all"):
+        raise HttpException(
+            task_id="",
+            status_code=400,
+            message="match must be 'any' or 'all'",
+        )
+
+    try:
+        results = tagging.search_materials_by_tags(
+            base_dir=base_dir,
+            characters=char_list,
+            emotions=emo_list,
+            events=evt_list,
+            keyword=kw,
+            match_mode=match,
+        )
+        return utils.get_response(
+            200,
+            {
+                "results": results[:limit],
+                "total": len(results),
+            },
+        )
+    except Exception as e:
+        logger.error(f"Failed to search materials by tags: {e}")
+        raise HttpException(
+            task_id="",
+            status_code=500,
+            message=f"Search failed: {str(e)}",
+        )
+
+
+@router.delete(
+    "/materials/tags",
+    summary="Delete tags for specified images",
+)
+def delete_material_tags(
+    request: Request,
+    body: TagDeleteRequest,
+):
+    base_dir = _get_material_dir()
+    deleted = 0
+    not_found = 0
+
+    for fp in body.file_paths:
+        try:
+            full_path = _normalize_material_path(base_dir, fp)
+            sidecar = tagging.get_sidecar_path(full_path, base_dir)
+            alt_path = full_path + ".tags.json"
+            found = os.path.isfile(sidecar) or os.path.isfile(alt_path)
+            if found:
+                tagging.delete_tags(full_path, base_dir)
+                deleted += 1
+            else:
+                not_found += 1
+        except HttpException:
+            not_found += 1
+        except HttpException:
+            not_found += 1
+
+    return utils.get_response(
+        200,
+        {
+            "deleted": deleted,
+            "not_found": not_found,
+        },
+    )
+
+
+@router.get(
+    "/materials/tags/{file_path:path}",
+    summary="Get tags for a single image",
+)
+def get_single_image_tags(
+    request: Request,
+    file_path: str = Path(..., description="Image file path relative to material directory"),
+):
+    base_dir = _get_material_dir()
+    full_path = _normalize_material_path(base_dir, file_path)
+
+    tags = tagging.load_tags(full_path, base_dir)
+    if tags is None:
+        raise HttpException(
+            task_id="",
+            status_code=404,
+            message=f"No tags found for: {file_path}",
+        )
+
+    return utils.get_response(200, tags.model_dump())

@@ -378,3 +378,123 @@ class VideoMaterialUploadResponse(BaseResponse):
                 },
             },
         }
+
+
+######################################################################################################
+# AI Image Tagging Models
+######################################################################################################
+
+
+class ImageTags(BaseModel):
+    """AI-generated tags for a single Crayon Shin-chan screenshot"""
+
+    file_path: str  # Relative path from material root
+    file_hash: str = ""  # MD5 hash for change detection
+
+    # Core tags (closed enumeration)
+    characters: list[str] = Field(default_factory=list)
+    emotions: list[str] = Field(default_factory=list)
+    events: list[str] = Field(default_factory=list)
+
+    # Auxiliary visual tags
+    description: str = ""  # Concise Chinese description (≤50 chars)
+    colors: list[str] = Field(default_factory=list)  # Dominant colors (2~5)
+
+    # Tracking info
+    model: str = ""  # Vision model used
+    created_at: str = ""  # ISO format timestamp
+
+
+class TagGenerateRequest(BaseModel):
+    """Request body for triggering batch tagging"""
+
+    force: bool = False
+    max_concurrent: int = Field(default=3, ge=1, le=10)
+
+
+class TagDeleteRequest(BaseModel):
+    """Request body for deleting tags"""
+
+    file_paths: list[str] = Field(..., min_length=1)
+
+
+class TagGenerateResponse(BaseResponse):
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "status": 200,
+                "message": "Tagging task started",
+                "data": {"task_id": "a1b2c3d4-..."},
+            },
+        }
+
+
+class TagStatusResponse(BaseResponse):
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "status": 200,
+                "message": "success",
+                "data": {
+                    "task_id": "a1b2c3d4-...",
+                    "state": "running",
+                    "progress": 45,
+                    "total": 120,
+                    "tagged": 54,
+                    "skipped": 0,
+                    "failed": 0,
+                    "current_file": "001.jpg",
+                    "errors": [],
+                },
+            },
+        }
+
+
+class TagSearchResponse(BaseResponse):
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "status": 200,
+                "message": "success",
+                "data": {
+                    "results": [
+                        {
+                            "file_path": "001.jpg",
+                            "characters": ["野原新之助", "野原美冴"],
+                            "emotions": ["震惊", "害怕"],
+                            "events": ["偷吃零食", "被妈妈骂"],
+                            "description": "小新偷吃布丁被美冴发现...",
+                            "colors": ["黄色", "橙色"],
+                            "match_score": 4,
+                            "match_detail": {
+                                "characters_matched": ["野原新之助", "野原美冴"],
+                                "emotions_matched": [],
+                                "events_matched": ["偷吃零食"],
+                                "keyword_matched": False,
+                            },
+                        }
+                    ],
+                    "total": 5,
+                },
+            },
+        }
+
+
+class TagStatsResponse(BaseResponse):
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "status": 200,
+                "message": "success",
+                "data": {
+                    "total_images": 150,
+                    "tagged_count": 120,
+                    "untagged_count": 30,
+                    "character_distribution": {"野原新之助": 85, "野原美冴": 40},
+                    "emotion_distribution": {"开心": 55, "生气": 30},
+                    "event_distribution": {"吃饭": 20},
+                    "color_distribution": {"黄色": 60},
+                    "avg_tags_per_image": 5.2,
+                },
+            },
+        }

@@ -123,6 +123,22 @@ support_locales = [
     "tr-TR",
 ]
 
+# Sidebar navigation
+with st.sidebar:
+    st.title("导航")
+    page = st.radio(
+        "页面导航",
+        ["🎬 视频生成", "🤖 AI 打标"],
+        label_visibility="collapsed",
+    )
+
+# Route to the appropriate page
+if page == "🤖 AI 打标":
+    import webui.pages.tagging as tagging_page
+
+    tagging_page.render()
+    st.stop()
+
 
 def get_all_fonts():
     fonts = []
@@ -949,6 +965,93 @@ with middle_panel:
                     )
                 else:
                     st.info("No material directory configured. Upload files or set `material_directory` in config.toml.")
+
+            # --- Tag-based material filter (only when local source) ---
+            if config.tagging.get("enabled", True):
+                with st.expander("🏷 按标签筛选素材 (AI打标)", expanded=False):
+                    try:
+                        from app.services import tagging as _tagging_svc
+
+                        _mat_dir = config.app.get("material_directory", "").strip()
+                        if not _mat_dir:
+                            _mat_dir = utils.storage_dir("local_videos", create=True)
+                        _tag_stats = _tagging_svc.get_tag_statistics(_mat_dir)
+                        _tagged = _tag_stats.get("tagged_count", 0)
+
+                        if _tagged > 0:
+                            from app.services.llm import get_tag_candidates as _get_cands
+                            _cands = _get_cands()
+
+                            tag_col_c, tag_col_e, tag_col_ev = st.columns(3)
+                            with tag_col_c:
+                                _filter_chars = st.multiselect(
+                                    "角色",
+                                    options=_cands.get("characters", []),
+                                    key="tag_filter_chars",
+                                )
+                            with tag_col_e:
+                                _filter_emos = st.multiselect(
+                                    "情绪",
+                                    options=_cands.get("emotions", []),
+                                    key="tag_filter_emos",
+                                )
+                            with tag_col_ev:
+                                _filter_evts = st.multiselect(
+                                    "事件",
+                                    options=_cands.get("events", []),
+                                    key="tag_filter_evts",
+                                )
+
+                            _filter_kw = st.text_input(
+                                "描述关键词",
+                                key="tag_filter_keyword",
+                                placeholder="模糊搜索描述...",
+                            )
+
+                            if st.button("🔍 按标签筛选", key="tag_filter_search_btn"):
+                                _results = _tagging_svc.search_materials_by_tags(
+                                    base_dir=_mat_dir,
+                                    characters=_filter_chars if _filter_chars else None,
+                                    emotions=_filter_emos if _filter_emos else None,
+                                    events=_filter_evts if _filter_evts else None,
+                                    keyword=_filter_kw.strip() if _filter_kw else None,
+                                )
+                                st.session_state["tag_filter_results"] = _results
+
+                            # Show tag filter results
+                            _filter_results = st.session_state.get("tag_filter_results", [])
+                            if _filter_results:
+                                st.caption(f"匹配: {len(_filter_results)} 张")
+                                # Allow user to select from filtered results
+                                _filter_display = [
+                                    f"{r.get('match_score', 0)}★ | {r['file_path']}"
+                                    for r in _filter_results
+                                ]
+                                _selected_filtered = st.multiselect(
+                                    "选择匹配的素材",
+                                    options=_filter_display,
+                                    key="selected_tag_filter_results",
+                                )
+                                # Append to existing selected materials
+                                if _selected_filtered:
+                                    _new_paths = []
+                                    for _sel in _selected_filtered:
+                                        # Extract file_path from display string "N★ | path"
+                                        _path_part = _sel.split(" | ", 1)[-1]
+                                        _new_paths.append(_path_part)
+                                    # Merge with existing selections
+                                    _existing = st.session_state.get("selected_material_paths", [])
+                                    for _p in _new_paths:
+                                        if _p not in _existing:
+                                            _existing.append(_p)
+                                    st.session_state["selected_material_paths"] = _existing
+                                    st.success(f"已添加 {len(_new_paths)} 张素材")
+                            elif st.session_state.get("tag_filter_results") is not None:
+                                st.info("未找到匹配素材")
+                        else:
+                            st.info("素材库中暂无已打标图片。请先前往「🤖 AI 打标」页面进行打标。")
+                    except Exception as _tag_exc:
+                        st.warning(f"标签筛选暂不可用: {_tag_exc}")
 
         selected_index = st.selectbox(
             tr("Video Concat Mode"),
