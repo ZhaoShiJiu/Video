@@ -87,7 +87,7 @@ def _prioritize_unique_source_clips(
     """
     优先让每个源素材只出现一次，降低成片里同一素材反复出现的概率。
 
-    线上素材经常会遇到“一个长视频被切成多个短片段”的情况。旧逻辑在
+    线上素材经常会遇到"一个长视频被切成多个短片段"的情况。旧逻辑在
     random 模式下直接打乱所有短片段，导致同一个源视频的多个切片可能
     分布在开头和中间，用户会感知为素材重复。本函数只调整片段顺序：
     先放每个源文件里最长的一个片段，剩余片段作为兜底；当素材总时长不足时，
@@ -336,7 +336,7 @@ def concat_video_clips_with_ffmpeg(
 
 def _sanitize_image_file(image_path: str) -> str:
     # 某些本地图片虽然能被 Pillow 打开，但会因为损坏的 EXIF/eXIf 元数据导致
-    # ImageClip 在解析阶段直接抛异常。这里重新导出一份“干净图片”，把坏元数据剥离掉。
+    # ImageClip 在解析阶段直接抛异常。这里重新导出一份"干净图片"，把坏元数据剥离掉。
     image_root, _ = os.path.splitext(image_path)
     sanitized_path = f"{image_root}.sanitized.png"
 
@@ -488,7 +488,7 @@ def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
         suffix = "*.mp3"
         song_dir = utils.song_dir()
         files = glob.glob(os.path.join(song_dir, suffix))
-        # 当背景音乐目录为空时，直接回退为“不使用 BGM”，避免 random.choice([]) 抛异常。
+        # 当背景音乐目录为空时，直接回退为"不使用 BGM"，避免 random.choice([]) 抛异常。
         if not files:
             logger.warning(f"no bgm files found in song directory: {song_dir}")
             return ""
@@ -539,7 +539,7 @@ def combine_videos(
             end_time = min(start_time + max_clip_duration, clip_duration)
 
             # 保留所有有效分段。
-            # 这样既不会丢掉“整段视频本身就短于 max_clip_duration”的素材，
+            # 这样既不会丢掉"整段视频本身就短于 max_clip_duration"的素材，
             # 也不会吞掉长视频最后剩下的一小段尾部内容。
             if end_time > start_time:
                 subclipped_items.append(
@@ -1088,6 +1088,60 @@ def generate_video(
     del video_clip
 
 
+def _find_in_material_dir(base_dir: str, filename: str) -> str:
+    """
+    在素材目录及其一级子目录中查找文件，返回 (文件绝对路径, 所属素材目录)。
+
+    当用户配置了外部素材目录且文件按类别分放在子目录中时（如 001-PNG/、
+    002-JPG/），material.url 可能是纯文件名或带子目录前缀的相对路径。
+    此函数优先查找直接路径匹配，若未命中则遍历一级子目录。
+    同时兼容上传到默认 storage/local_videos/ 目录的文件。
+
+    Args:
+        base_dir: 素材库根目录的绝对路径（来自 material_directory 配置）
+        filename: material.url，可能是纯文件名、"子目录/文件名" 或绝对路径
+
+    Returns:
+        (file_path, effective_base_dir) 元组 — file_path 是匹配到的文件绝对路径，
+        effective_base_dir 是文件实际所在的素材目录，用于安全校验。
+        若未找到，返回 (base_dir 下的直接拼接路径, base_dir)。
+    """
+    # 绝对路径：来自 WebUI 上传，文件在 storage/local_videos/ 下
+    if os.path.isabs(filename) and os.path.isfile(filename):
+        default_dir = utils.storage_dir("local_videos", create=False)
+        if default_dir:
+            try:
+                if os.path.commonpath([default_dir, filename]) == default_dir:
+                    return filename, default_dir
+            except ValueError:
+                pass
+        return filename, base_dir
+
+    direct = os.path.join(base_dir, filename)
+    if os.path.isfile(direct):
+        return direct, base_dir
+
+    # 在 base_dir 的一级子目录中递归查找
+    try:
+        for entry in os.scandir(base_dir):
+            if entry.is_dir():
+                candidate = os.path.join(entry.path, filename)
+                if os.path.isfile(candidate):
+                    return candidate, base_dir
+    except OSError:
+        pass
+
+    # Fallback: 也检查默认 storage/local_videos/ 目录
+    # 当配置了外部素材目录但用户仍上传了文件到默认目录时使用
+    default_dir = utils.storage_dir("local_videos", create=False)
+    if default_dir and os.path.isdir(default_dir) and default_dir != base_dir:
+        fallback = os.path.join(default_dir, os.path.basename(filename))
+        if os.path.isfile(fallback):
+            return fallback, default_dir
+
+    return direct, base_dir
+
+
 def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
     # WebUI 在某些二次生成场景下可能传入空素材列表，这里直接返回空结果，避免抛出 NoneType 异常。
     if not materials:
@@ -1095,15 +1149,21 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
 
     # 仅返回通过预处理校验的素材，避免低分辨率图片继续进入后续的视频合成流程。
     valid_materials = []
-    local_videos_dir = utils.storage_dir("local_videos", create=True)
+    # 优先使用配置的外部素材目录，未配置则回退到项目默认目录
+    _material_dir = config.app.get("material_directory", "").strip()
+    if _material_dir:
+        local_videos_dir = _material_dir
+    else:
+        local_videos_dir = utils.storage_dir("local_videos", create=True)
 
     for material in materials:
         if not material.url:
             continue
 
         try:
+            _resolved_path, _validate_dir = _find_in_material_dir(local_videos_dir, material.url)
             material_source_path = file_security.resolve_path_within_directory(
-                local_videos_dir, material.url
+                _validate_dir, _resolved_path
             )
         except ValueError as exc:
             # local video_source 的素材路径来自 API 参数，必须限制在专用素材目录。

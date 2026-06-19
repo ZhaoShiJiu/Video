@@ -169,6 +169,20 @@ ui = _cfg.get(
     },
 )
 
+# Normalize material_directory path: the third-party "toml" library may
+# incorrectly interpret backslash sequences like \v (vertical tab) in Windows
+# paths, producing corrupted characters. Convert to forward slashes which are
+# safe in TOML and work correctly on Windows Python.
+_md = app.get("material_directory", "")
+if _md:
+    _normalized = _md.replace("\\", "/")
+    if os.path.isdir(_normalized):
+        app["material_directory"] = _normalized
+    elif not os.path.isdir(_md):
+        logger.warning(
+            f"material_directory does not exist or is not accessible: {_md}"
+        )
+
 hostname = socket.gethostname()
 
 log_level = _cfg.get("log_level", "DEBUG")

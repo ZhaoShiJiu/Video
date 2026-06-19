@@ -143,6 +143,58 @@ def get_all_songs():
     return songs
 
 
+def get_material_files():
+    """
+    Scan the configured material directory for existing media files.
+    Returns a list of (display_name, relative_path) tuples.
+    """
+    import glob as glob_mod
+
+    _material_dir = config.app.get("material_directory", "").strip()
+    if _material_dir:
+        base_dir = _material_dir
+    else:
+        base_dir = utils.storage_dir("local_videos", create=True)
+
+    # Try multiple path formats in case the TOML parser corrupted backslash sequences
+    if not os.path.isdir(base_dir):
+        # Try with backslashes replaced
+        alt = base_dir.replace("/", "\\")
+        if os.path.isdir(alt):
+            base_dir = alt
+        else:
+            # Try forward slashes
+            alt = base_dir.replace("\\", "/")
+            if os.path.isdir(alt):
+                base_dir = alt
+
+    if not os.path.isdir(base_dir):
+        return []
+
+    allowed_ext = ("mp4", "mov", "avi", "flv", "mkv", "jpg", "jpeg", "png")
+    files = []
+    for ext in allowed_ext:
+        files.extend(glob_mod.glob(os.path.join(base_dir, f"*.{ext}")))
+        if _material_dir:
+            files.extend(glob_mod.glob(os.path.join(base_dir, f"*/*.{ext}")))
+
+    # Sort by filename for stable display
+    files.sort(key=lambda f: os.path.basename(f).lower())
+
+    result = []
+    for f in files:
+        if _material_dir:
+            try:
+                rel_path = os.path.relpath(f, base_dir)
+            except ValueError:
+                rel_path = os.path.basename(f)
+        else:
+            rel_path = os.path.basename(f)
+        result.append((os.path.basename(f), rel_path))
+
+    return result
+
+
 def open_task_folder(task_id):
     try:
         # task_id 应始终是服务端生成的 UUID。这里先做格式校验，避免异常值
@@ -839,6 +891,65 @@ with middle_panel:
                 accept_multiple_files=True,
             )
 
+            # Show existing files from the material directory for direct selection
+            material_files = get_material_files()
+            if material_files:
+                st.caption(tr("Or select from existing material library"))
+                display_names = [name for name, _ in material_files]
+                selected_display_names = st.multiselect(
+                    tr("Existing Materials"),
+                    options=display_names,
+                    key="selected_material_files",
+                    help=tr("Search and select files already in the material directory"),
+                )
+                # Store the selected relative paths for use when starting the task
+                st.session_state["selected_material_paths"] = [
+                    rel_path
+                    for name, rel_path in material_files
+                    if name in selected_display_names
+                ]
+            else:
+                st.session_state["selected_material_paths"] = []
+                # Show diagnostic info when no files are found
+                _md = config.app.get("material_directory", "").strip()
+                if _md:
+                    _exists = os.path.isdir(_md)
+                    _alt_bs = _md.replace("/", "\\")
+                    _alt_fs = _md.replace("\\", "/")
+
+                    # Try to list the directory and capture any error
+                    _list_error = ""
+                    for _test_path in (_md, _alt_bs, _alt_fs):
+                        try:
+                            _entries = os.listdir(_test_path)
+                            _list_error = f"listdir('{_test_path}') succeeded: {len(_entries)} entries"
+                            break
+                        except Exception as _e:
+                            _list_error += f"listdir('{_test_path}'): {type(_e).__name__}: {_e}\n\n"
+
+                    # Also try the original backslash path from config file
+                    import tomllib as _tomllib
+                    _raw_val = ""
+                    try:
+                        with open("config.toml", "rb") as _f:
+                            _raw = _tomllib.load(_f)
+                            _raw_val = _raw.get("app", {}).get("material_directory", "")
+                    except Exception:
+                        _raw_val = "(failed to read)"
+
+                    st.info(
+                        f"**Material directory:** `{_md}`\n\n"
+                        f"**repr():** `{repr(_md)}`\n\n"
+                        f"**isdir (as-is):** {_exists}\n\n"
+                        f"**isdir (backslash):** {os.path.isdir(_alt_bs)}\n\n"
+                        f"**isdir (forwardslash):** {os.path.isdir(_alt_fs)}\n\n"
+                        f"**listdir results:**\n{_list_error}\n\n"
+                        f"**tomllib raw value:** `{repr(_raw_val)}`\n"
+                        f"**tomllib isdir:** {os.path.isdir(_raw_val)}"
+                    )
+                else:
+                    st.info("No material directory configured. Upload files or set `material_directory` in config.toml.")
+
         selected_index = st.selectbox(
             tr("Video Concat Mode"),
             index=1,
@@ -1478,15 +1589,21 @@ if start_button:
             f.write(uploaded_audio_file.getbuffer())
         params.custom_audio_file = custom_audio_path
 
-    if uploaded_files:
-        local_videos_dir = utils.storage_dir("local_videos", create=True)
-        # 每次重新上传时都以本次选择的素材为准，避免旧素材不断重复追加。
+    # Collect selected existing files from the material directory
+    selected_existing = st.session_state.get("selected_material_paths", [])
+
+    if uploaded_files or selected_existing:
+        # 每次重新选择时都以本次选择的素材为准，避免旧素材不断重复追加。
         params.video_materials = []
         persisted_local_materials = []
-        for file in uploaded_files:
-            file_path = os.path.join(local_videos_dir, f"{file.file_id}_{file.name}")
-            with open(file_path, "wb") as f:
-                f.write(file.getbuffer())
+
+        # Handle uploaded files (saved to local_videos directory)
+        if uploaded_files:
+            local_videos_dir = utils.storage_dir("local_videos", create=True)
+            for file in uploaded_files:
+                file_path = os.path.join(local_videos_dir, f"{file.file_id}_{file.name}")
+                with open(file_path, "wb") as f:
+                    f.write(file.getbuffer())
                 m = MaterialInfo()
                 m.provider = "local"
                 m.url = file_path
@@ -1498,10 +1615,26 @@ if start_button:
                         "duration": m.duration,
                     }
                 )
-        # 将已上传并保存到本地的视频素材写入会话，供后续只改文案时直接复用。
+
+        # Handle selected existing files from the material directory
+        if selected_existing:
+            for rel_path in selected_existing:
+                m = MaterialInfo()
+                m.provider = "local"
+                m.url = rel_path  # relative path like "001-PNG/xxx.png" or just "xxx.png"
+                params.video_materials.append(m)
+                persisted_local_materials.append(
+                    {
+                        "provider": m.provider,
+                        "url": m.url,
+                        "duration": m.duration,
+                    }
+                )
+
+        # 将已选择的素材写入会话，供后续只改文案时直接复用。
         st.session_state["local_video_materials"] = persisted_local_materials
     elif params.video_source == "local" and st.session_state["local_video_materials"]:
-        # 当用户没有重新上传文件时，复用最近一次已经保存到磁盘的本地素材列表。
+        # 当用户没有重新选择文件时，复用最近一次已经保存到磁盘的本地素材列表。
         params.video_materials = []
         for material in st.session_state["local_video_materials"]:
             m = MaterialInfo()

@@ -1,5 +1,6 @@
 x-common-volumes: &common-volumes
   - ./:/MoneyPrinterTurbo
+  - D:/CODE/vedio-library/251208-蜡笔小新-总合集:/materials:ro
 
 services:
   webui:

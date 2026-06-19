@@ -284,23 +284,38 @@ def upload_bgm_file(request: Request, file: UploadFile = File(...)):
 )
 def get_video_materials_list(request: Request):
     allowed_suffixes = ("mp4", "mov", "avi", "flv", "mkv", "jpg", "jpeg", "png")
-    local_videos_dir = utils.storage_dir("local_videos", create=True)
+    # 优先使用配置的外部素材目录，未配置则回退到项目默认目录
+    _material_dir = config.app.get("material_directory", "").strip()
+    local_videos_dir = _material_dir or utils.storage_dir("local_videos", create=True)
     files = []
     for suffix in allowed_suffixes:
         files.extend(glob.glob(os.path.join(local_videos_dir, f"*.{suffix}")))
-    # 文件系统枚举顺序不稳定，直接返回会导致“顺序拼接”在不同机器或不同
+        # 外部素材目录通常按类别分放在子目录中，需要递归扫描一级子目录
+        if _material_dir:
+            files.extend(glob.glob(os.path.join(local_videos_dir, f"*/*.{suffix}")))
+    # 文件系统枚举顺序不稳定，直接返回会导致"顺序拼接"在不同机器或不同
     # 时刻表现不一致。这里统一按文件名排序，至少保证服务端返回顺序可预测。
     files.sort(key=lambda file_path: os.path.basename(file_path).lower())
     video_materials_list = []
     for file in files:
         filename = os.path.basename(file)
+        # 外部素材目录下，返回相对于根目录的路径（如 "001-PNG/xxx.png"），
+        # 以便 preprocess_video 能正确定位子目录中的文件。
+        # 默认目录下保持原有行为（只返回文件名），向后兼容。
+        if _material_dir:
+            try:
+                display_path = os.path.relpath(file, local_videos_dir)
+            except ValueError:
+                display_path = filename
+        else:
+            display_path = filename
         video_materials_list.append(
             {
                 "name": filename,
                 "size": os.path.getsize(file),
                 # 与 BGM 一样，只返回文件名；创建任务时再在 local_videos
                 # 白名单目录内解析，避免 API 泄露宿主机绝对路径。
-                "file": filename,
+                "file": display_path,
             }
         )
     response = {"files": video_materials_list}
@@ -320,7 +335,9 @@ def upload_video_material_file(request: Request, file: UploadFile = File(...)):
     normalized_filename = safe_filename.lower()
     # 统一按小写扩展名校验，兼容 .MOV 这类大写后缀文件。
     if normalized_filename.endswith(allowed_suffixes):
-        local_videos_dir = utils.storage_dir("local_videos", create=True)
+        # 优先上传到配置的外部素材目录，未配置则回退到项目默认目录
+        _material_dir = config.app.get("material_directory", "").strip()
+        local_videos_dir = _material_dir or utils.storage_dir("local_videos", create=True)
         save_path = os.path.join(local_videos_dir, safe_filename)
         # save file
         with open(save_path, "wb+") as buffer:
