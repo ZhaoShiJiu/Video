@@ -899,6 +899,22 @@ with middle_panel:
         config.app["video_source"] = params.video_source
 
         if params.video_source == "local":
+            # --- 提示用户标签库自动匹配功能 ---
+            _tagging_enabled = config.tagging.get("enabled", True)
+            if _tagging_enabled:
+                _match_enabled = bool(st.session_state.get("match_materials_to_script", False))
+                if _match_enabled:
+                    st.success(
+                        "🤖 **Match Materials to Script Order** is ON — AI will further "
+                        "augment your material list with additional tagged images."
+                    )
+                else:
+                    st.info(
+                        "💡 When no files are manually selected, the system will "
+                        "**automatically** find matching materials from the tagged library "
+                        "based on your video script. No manual selection required."
+                    )
+
             # Streamlit 的文件类型校验对扩展名大小写敏感，这里同时放行大小写两种形式。
             local_file_types = ["mp4", "mov", "avi", "flv", "mkv", "jpg", "jpeg", "png"]
             uploaded_files = st.file_uploader(

@@ -172,19 +172,86 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
 def get_video_materials(task_id, params, video_terms, audio_duration):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
+
+        _tagging_enabled = config.tagging.get("enabled", True)
+
+        # --- Step 0: 当用户未手动选择素材时，自动从标签库匹配 ---
+        # 选了 local 源但不传素材 = 明确希望系统自动从素材库选取。
+        _has_materials = bool(params.video_materials)
+        if _tagging_enabled and not _has_materials:
+            try:
+                from app.services import tagging
+
+                _mat_dir = config.app.get("material_directory", "").strip()
+                if not _mat_dir:
+                    _mat_dir = utils.storage_dir("local_videos", create=True)
+
+                if not os.path.isdir(_mat_dir):
+                    logger.warning(
+                        f"material directory does not exist: {_mat_dir!r}. "
+                        f"Falling back to default local_videos directory."
+                    )
+                    _mat_dir = utils.storage_dir("local_videos", create=True)
+
+                script = getattr(params, "video_script", "") or ""
+                if script and os.path.isdir(_mat_dir):
+                    tagged_paths = tagging.match_materials_by_tags(
+                        script_text=script,
+                        tagged_dir=_mat_dir,
+                        top_k=15,
+                    )
+                    if tagged_paths:
+                        from app.models.schema import MaterialInfo
+
+                        if params.video_materials is None:
+                            params.video_materials = []
+
+                        for tp in tagged_paths:
+                            full = tp if os.path.isabs(tp) else os.path.join(_mat_dir, tp)
+                            if not os.path.isfile(full):
+                                continue
+                            if full in [m.url for m in (params.video_materials or [])]:
+                                continue
+                            mi = MaterialInfo()
+                            mi.provider = "local"
+                            mi.url = full
+                            mi.duration = 0
+                            params.video_materials.append(mi)
+                        logger.info(
+                            f"Tag-based auto-matching: {len(tagged_paths)} materials "
+                            f"matched from script analysis"
+                        )
+                    else:
+                        logger.info(
+                            "Tag-based auto-matching returned no results. "
+                            "No relevant tagged images found for this script."
+                        )
+                else:
+                    logger.warning(
+                        f"Tag-based auto-matching skipped: "
+                        f"script_empty={not bool(script)}, "
+                        f"mat_dir_exists={os.path.isdir(_mat_dir)}, "
+                        f"mat_dir={_mat_dir!r}"
+                    )
+            except Exception as e:
+                logger.warning(f"Tag-based auto-matching failed: {e}")
+
         materials = video.preprocess_video(
             materials=params.video_materials, clip_duration=params.video_clip_duration
         )
         if not materials:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
             logger.error(
-                "no valid materials found, please check the materials and try again."
+                "no valid materials found. "
+                "Please either:\n"
+                "  1. Make sure the material directory contains tagged images "
+                "(run AI tagging first), or\n"
+                "  2. Manually upload or select materials from the local material directory."
             )
             return None
 
-        # Tag-based material matching: if enabled and tagged images exist,
-        # augment the material list with relevance-matched images
-        if params.match_materials_to_script and config.tagging.get("enabled", True):
+        # --- 标签增强: match_materials_to_script 开启时，额外补充标签匹配的素材 ---
+        if params.match_materials_to_script and _tagging_enabled:
             try:
                 from app.services import tagging
 
@@ -202,26 +269,27 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
                     if tagged_paths:
                         from app.models.schema import MaterialInfo
 
-                        _mat_dir_resolved = _mat_dir
+                        _existing_urls = {
+                            m.url for m in materials
+                        }
                         for tp in tagged_paths:
-                            # Build full path
-                            if os.path.isabs(tp):
-                                full = tp
-                            else:
-                                full = os.path.join(_mat_dir_resolved, tp)
-                            if os.path.isfile(full) and full not in [
-                                m.url for m in materials
-                            ]:
-                                mi = MaterialInfo()
-                                mi.provider = "local"
-                                mi.url = tp  # relative path
-                                mi.duration = 0
-                                materials.append(mi)
+                            full = tp if os.path.isabs(tp) else os.path.join(_mat_dir, tp)
+                            if not os.path.isfile(full):
+                                continue
+                            if full in _existing_urls:
+                                continue
+                            mi = MaterialInfo()
+                            mi.provider = "local"
+                            mi.url = full
+                            mi.duration = 0
+                            materials.append(mi)
+                            _existing_urls.add(full)
                         logger.info(
-                            f"Tag-based matching added {len(tagged_paths)} relevant materials"
+                            f"Tag-based augmentation added {len(tagged_paths)} "
+                            f"additional materials"
                         )
             except Exception as e:
-                logger.warning(f"Tag-based material matching failed: {e}")
+                logger.warning(f"Tag-based material augmentation failed: {e}")
 
         return [material_info.url for material_info in materials]
     else:
@@ -313,6 +381,8 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
 
     # 1. Generate script
     video_script = generate_script(task_id, params)
+    # 将生成的脚本写回 params，供下游 get_video_materials() 的标签自动匹配使用
+    params.video_script = video_script
     if not video_script or "Error: " in video_script:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
         return

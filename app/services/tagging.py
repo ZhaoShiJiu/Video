@@ -10,6 +10,7 @@ Core logic for:
 import hashlib
 import json
 import os
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -22,10 +23,6 @@ from app.models.const import FILE_TYPE_IMAGES
 from app.models.schema import ImageTags
 from app.services import llm
 from app.services import state as sm
-
-# Cache for read-only filesystem detection
-_sidecar_writable_cache: Dict[str, bool] = {}
-
 
 def compute_image_hash(image_path: str) -> str:
     """
@@ -41,19 +38,20 @@ def compute_image_hash(image_path: str) -> str:
     return hash_md5.hexdigest()
 
 
-def _get_fallback_tags_dir() -> str:
-    """Get the fallback writable directory for sidecar tag files."""
+def _get_tags_dir() -> str:
+    """Get the unified writable directory for all sidecar tag files."""
     from app.utils import utils
     tags_dir = os.path.join(utils.storage_dir("tags", create=True))
     return tags_dir
 
 
-def _normalize_path_for_fallback(image_path: str, base_dir: str) -> str:
+def _normalize_path_for_tags(image_path: str) -> str:
     """
-    Convert an absolute image path to a relative path under the fallback tags dir.
-    Preserves directory structure so tags from different material dirs don't collide.
+    Convert an absolute image path to a safe relative path under storage/tags/.
+
+    Uses the absolute path with separators replaced so tags from different
+    material directories never collide.
     """
-    # Use the absolute path, replace separators to create a flat or hierarchical key
     abs_path = os.path.abspath(image_path)
     # Replace OS separators and colons (Windows) to create safe filename
     safe = abs_path.replace(":", "_").replace("\\", "/")
@@ -62,74 +60,29 @@ def _normalize_path_for_fallback(image_path: str, base_dir: str) -> str:
     return safe
 
 
-def _is_path_writable(directory: str) -> bool:
-    """Check if a directory is writable (cached per directory)."""
-    if directory in _sidecar_writable_cache:
-        return _sidecar_writable_cache[directory]
-
-    # Find the nearest existing parent directory
-    check_dir = directory
-    while check_dir and not os.path.exists(check_dir):
-        check_dir = os.path.dirname(check_dir)
-
-    if not check_dir:
-        _sidecar_writable_cache[directory] = False
-        return False
-
-    writable = os.access(check_dir, os.W_OK)
-    _sidecar_writable_cache[directory] = writable
-    return writable
-
-
 def get_sidecar_path(image_path: str, base_dir: str = "") -> str:
     """
     Get the sidecar tags file path.
 
-    Prefers alongside-image location (xxx.jpg → xxx.jpg.tags.json).
-    Falls back to storage/tags/ directory when the image directory is read-only.
-
-    Also checks if an existing sidecar exists in the fallback location.
+    All tags are stored under storage/tags/, keyed by the absolute image path.
+    This eliminates the dual-write (side-by-side vs fallback) inconsistency
+    that caused partial-tag-display bugs across sessions.
     """
-    side_by_side = image_path + ".tags.json"
-
-    # If the side-by-side file already exists, always use it
-    if os.path.isfile(side_by_side):
-        return side_by_side
-
-    # Check if we can write to the image's directory
-    img_dir = os.path.dirname(image_path)
-    if _is_path_writable(img_dir):
-        return side_by_side
-
-    # Use fallback writable location
-    fallback_dir = _get_fallback_tags_dir()
-    # Resolve base_dir for proper relative path in fallback
-    if not base_dir:
-        base_dir = config.app.get("material_directory", "").strip()
-        if not base_dir:
-            from app.utils import utils
-            base_dir = utils.storage_dir("local_videos", create=True)
-
-    safe_name = _normalize_path_for_fallback(image_path, base_dir)
-    fallback_path = os.path.join(fallback_dir, safe_name + ".tags.json")
+    tags_dir = _get_tags_dir()
+    safe_name = _normalize_path_for_tags(image_path)
+    tags_path = os.path.join(tags_dir, safe_name + ".tags.json")
 
     # Ensure parent directory exists
-    fallback_parent = os.path.dirname(fallback_path)
-    if not os.path.isdir(fallback_parent):
-        os.makedirs(fallback_parent, exist_ok=True)
+    tags_parent = os.path.dirname(tags_path)
+    if not os.path.isdir(tags_parent):
+        os.makedirs(tags_parent, exist_ok=True)
 
-    return fallback_path
+    return tags_path
 
 
 def load_tags(image_path: str, base_dir: str = "") -> Optional[ImageTags]:
-    """Load existing tags from sidecar file. Returns None if missing or corrupted."""
-    # Try side-by-side first, then fallback
+    """Load existing tags from sidecar file under storage/tags/. Returns None if missing or corrupted."""
     sidecar = get_sidecar_path(image_path, base_dir)
-
-    # Also check the other location if current path is fallback
-    alt_path = image_path + ".tags.json"
-    if sidecar != alt_path and not os.path.isfile(sidecar) and os.path.isfile(alt_path):
-        sidecar = alt_path
 
     if not os.path.isfile(sidecar):
         return None
@@ -143,33 +96,65 @@ def load_tags(image_path: str, base_dir: str = "") -> Optional[ImageTags]:
 
 
 def save_tags(image_path: str, tags: ImageTags, base_dir: str = "") -> None:
-    """Write tags to sidecar JSON file (with read-only fallback)."""
+    """Write tags to sidecar JSON file under storage/tags/."""
     sidecar = get_sidecar_path(image_path, base_dir)
-    try:
-        with open(sidecar, "w", encoding="utf-8") as f:
-            json.dump(tags.model_dump(), f, ensure_ascii=False, indent=2)
-    except OSError as e:
-        # If the side-by-side path failed due to read-only, retry with fallback forced
-        img_dir = os.path.dirname(image_path)
-        if not _is_path_writable(img_dir):
-            _sidecar_writable_cache[img_dir] = False
-            fallback_sidecar = get_sidecar_path(image_path, base_dir)
-            if fallback_sidecar != sidecar:
-                logger.info(f"Using fallback tags location: {fallback_sidecar}")
-                with open(fallback_sidecar, "w", encoding="utf-8") as f:
-                    json.dump(tags.model_dump(), f, ensure_ascii=False, indent=2)
-                return
-        raise
+    with open(sidecar, "w", encoding="utf-8") as f:
+        json.dump(tags.model_dump(), f, ensure_ascii=False, indent=2)
 
 
 def delete_tags(image_path: str, base_dir: str = "") -> None:
-    """Delete sidecar tags file (checks both side-by-side and fallback locations)."""
-    for path in [
-        image_path + ".tags.json",
-        get_sidecar_path(image_path, base_dir),
-    ]:
-        if os.path.isfile(path):
-            os.remove(path)
+    """Delete sidecar tags file from storage/tags/."""
+    path = get_sidecar_path(image_path, base_dir)
+    if os.path.isfile(path):
+        os.remove(path)
+
+
+# Track whether old side-by-side tags have been migrated to storage/tags/
+_migration_done = False
+
+
+def migrate_old_tags(base_dir: str) -> int:
+    """
+    One-time migration: move all old side-by-side .tags.json files
+    (from before unified storage) into storage/tags/.
+
+    Returns the number of tags migrated.
+    """
+    global _migration_done
+    if _migration_done:
+        return 0
+
+    images = _find_all_images(base_dir)
+    migrated = 0
+
+    for img_path in images:
+        old_sidecar = img_path + ".tags.json"
+        if not os.path.isfile(old_sidecar):
+            continue
+
+        # Already have tags in the unified location? Skip (unified wins)
+        unified = get_sidecar_path(img_path, base_dir)
+        if os.path.isfile(unified):
+            try:
+                os.remove(old_sidecar)
+            except OSError:
+                pass
+            continue
+
+        # Move old sidecar to unified location
+        try:
+            unified_parent = os.path.dirname(unified)
+            if not os.path.isdir(unified_parent):
+                os.makedirs(unified_parent, exist_ok=True)
+            shutil.move(old_sidecar, unified)
+            migrated += 1
+        except OSError as e:
+            logger.warning(f"Failed to migrate {old_sidecar}: {e}")
+
+    _migration_done = True
+    if migrated > 0:
+        logger.info(f"Migrated {migrated} old side-by-side tag files to storage/tags/")
+    return migrated
 
 
 def _find_all_images(base_dir: str) -> List[str]:
@@ -536,6 +521,9 @@ def get_tag_statistics(base_dir: str) -> dict:
         "avg_tags_per_image": N,
     }
     """
+    # One-time migration: move old side-by-side .tags.json into storage/tags/
+    migrate_old_tags(base_dir)
+
     all_tags = _load_all_tags(base_dir)
     all_images = _find_all_images(base_dir)
 
