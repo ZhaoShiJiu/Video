@@ -137,14 +137,26 @@ def load_config():
 
     logger.info(f"load config from file: {config_file}")
 
-    try:
-        _config_ = toml.load(config_file)
-    except Exception as e:
-        logger.warning(f"load config failed: {str(e)}, try to load as utf-8-sig")
-        with open(config_file, mode="r", encoding="utf-8-sig") as fp:
-            _cfg_content = fp.read()
-            _config_ = toml.loads(_cfg_content)
-    return _config_
+    _encodings = ("utf-8", "utf-8-sig", "gbk", "gb2312", "latin-1")
+    _last_error = None
+
+    for _enc in _encodings:
+        try:
+            with open(config_file, mode="r", encoding=_enc) as _fp:
+                _config_ = toml.loads(_fp.read())
+            if _enc != "utf-8":
+                logger.info(f"config.toml loaded with encoding: {_enc}")
+            return _config_
+        except Exception as _e:
+            _last_error = _e
+            continue
+
+    logger.error(
+        f"failed to load config.toml with any encoding. "
+        f"Last error: {_last_error}. "
+        f"Using empty defaults — WebUI may show broken settings."
+    )
+    return {}
 
 
 def save_config():
