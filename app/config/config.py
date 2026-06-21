@@ -187,14 +187,24 @@ tagging = _cfg.get("tagging", {})
 # incorrectly interpret backslash sequences like \v (vertical tab) in Windows
 # paths, producing corrupted characters. Convert to forward slashes which are
 # safe in TOML and work correctly on Windows Python.
+#
+# Startup validation: if the configured path does not exist, auto-fallback to
+# the project's storage/local_videos directory instead of silently keeping a
+# broken value that will cause downstream failures.
 _md = app.get("material_directory", "")
 if _md:
     _normalized = _md.replace("\\", "/")
     if os.path.isdir(_normalized):
         app["material_directory"] = _normalized
-    elif not os.path.isdir(_md):
+    else:
+        # Configured path is invalid — auto-fallback to project-local directory
+        _fallback = os.path.join(root_dir, "storage", "local_videos")
+        os.makedirs(_fallback, exist_ok=True)
+        app["material_directory"] = _fallback
         logger.warning(
-            f"material_directory does not exist or is not accessible: {_md}"
+            f"Configured material_directory {_md!r} does not exist or is not "
+            f"accessible. Automatically falling back to: {_fallback!r}. "
+            f"Please update config.toml [app] material_directory to a valid path."
         )
 
 hostname = socket.gethostname()

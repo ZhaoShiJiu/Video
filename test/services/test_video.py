@@ -107,7 +107,7 @@ class TestVideoService(unittest.TestCase):
         print(m)
 
         try:
-            materials = vd.preprocess_video([m], clip_duration=4)
+            materials, _ = vd.preprocess_video([m], task_id="test-video", clip_duration=4)
             print(materials)
 
             # verify result
@@ -136,7 +136,7 @@ class TestVideoService(unittest.TestCase):
         """
         m = MaterialInfo(provider="local", url=self.test_img_path)
 
-        materials = vd.preprocess_video([m], clip_duration=4)
+        materials, _ = vd.preprocess_video([m], task_id="test-video", clip_duration=4)
 
         self.assertEqual(materials, [])
 

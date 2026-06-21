@@ -1142,13 +1142,14 @@ def _find_in_material_dir(base_dir: str, filename: str) -> str:
     return direct, base_dir
 
 
-def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
+def preprocess_video(materials: List[MaterialInfo], task_id: str, clip_duration=4):
     # WebUI 在某些二次生成场景下可能传入空素材列表，这里直接返回空结果，避免抛出 NoneType 异常。
     if not materials:
-        return []
+        return [], []
 
     # 仅返回通过预处理校验的素材，避免低分辨率图片继续进入后续的视频合成流程。
     valid_materials = []
+    _intermediate_files = []
     # 优先使用配置的外部素材目录，未配置则回退到项目默认目录
     _material_dir = config.app.get("material_directory", "").strip()
     if _material_dir:
@@ -1223,17 +1224,40 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                     lambda t: 1 + (clip_duration * 0.03) * (t / clip.duration)
                 )
 
-                # Optionally, create a composite video clip containing the zoomed clip.
-                # This is useful when you want to add other elements to the video.
-                final_clip = CompositeVideoClip([zoom_clip])
+                # 限制中间编码文件的最大分辨率，避免超高像素图片导致 FFMPEG OOM。
+                # Docker 容器通常只有 1–2 GB 内存，4333×4307 这类 18 MP 图片单帧
+                # 即占 ~56 MB，编码 3s×30fps 的中间视频时极易触发 OOM Killer。
+                _max_dim = 1920
+                _w, _h = zoom_clip.size
+                if _w > _max_dim or _h > _max_dim:
+                    zoom_clip = zoom_clip.resized(
+                        width=_max_dim if _w >= _h else None,
+                        height=_max_dim if _h > _w else None,
+                    )
 
-                # Output the video to a file.
-                video_file = f"{material_source_path}.mp4"
-                final_clip.write_videofile(video_file, fps=30, logger=None)
+                _task_dir = utils.task_dir(task_id)
+                _idx = len(valid_materials)
+                video_file = os.path.join(_task_dir, f"material_{_idx}.mp4")
+                logger.info(f"encoding material [{_idx}]: source={material_source_path}, size={width}x{height}")
+                try:
+                    zoom_clip.write_videofile(video_file, fps=30, logger=None)
+                except OSError as exc:
+                    if "Broken pipe" in str(exc):
+                        raise RuntimeError(
+                            f"FFMPEG crashed while encoding {material_source_path} "
+                            f"(original size={width}x{height}, export size={_w}x{_h}). "
+                            f"This may be caused by insufficient container memory or "
+                            f"a corrupted source image. Try reducing the image resolution "
+                            f"or checking the file integrity."
+                        ) from exc
+                    raise
                 close_clip(clip)
-                close_clip(final_clip)
+                close_clip(zoom_clip)
                 material.url = video_file
-                logger.success(f"image processed: {video_file}")
+                _intermediate_files.append(video_file)
+                logger.success(
+                    f"image processed: {video_file} (source: {material_source_path})"
+                )
             else:
                 # 普通视频素材只需要读取尺寸做校验，校验完成后立即释放句柄即可。
                 close_clip(clip)
@@ -1246,4 +1270,4 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
 
         valid_materials.append(material)
 
-    return valid_materials
+    return valid_materials, _intermediate_files

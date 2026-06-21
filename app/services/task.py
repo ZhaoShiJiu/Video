@@ -1,5 +1,6 @@
 import math
 import os.path
+import random
 import re
 from os import path
 
@@ -226,6 +227,33 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
                             "Tag-based auto-matching returned no results. "
                             "No relevant tagged images found for this script."
                         )
+                        # --- Fallback: random sampling from material directory ---
+                        # When semantic matching fails (common for abstract scripts
+                        # like "机会成本"), don't fail immediately. Instead, randomly
+                        # pick images from the material directory as a fallback.
+                        _all_images = tagging._find_all_images(_mat_dir)
+                        if _all_images:
+                            from app.models.schema import MaterialInfo
+
+                            _sample_count = min(15, len(_all_images))
+                            _sampled = random.sample(_all_images, _sample_count)
+                            if params.video_materials is None:
+                                params.video_materials = []
+                            for _img in _sampled:
+                                mi = MaterialInfo()
+                                mi.provider = "local"
+                                mi.url = _img
+                                mi.duration = 0
+                                params.video_materials.append(mi)
+                            logger.info(
+                                f"Random fallback: selected {_sample_count} images "
+                                f"from material directory (no semantic match available)"
+                            )
+                        else:
+                            logger.warning(
+                                f"Random fallback failed: no images found in "
+                                f"material directory {_mat_dir!r}"
+                            )
                 else:
                     logger.warning(
                         f"Tag-based auto-matching skipped: "
@@ -236,8 +264,8 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             except Exception as e:
                 logger.warning(f"Tag-based auto-matching failed: {e}")
 
-        materials = video.preprocess_video(
-            materials=params.video_materials, clip_duration=params.video_clip_duration
+        materials, _intermediate_files = video.preprocess_video(
+            materials=params.video_materials, task_id=task_id, clip_duration=params.video_clip_duration
         )
         if not materials:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
@@ -291,7 +319,7 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             except Exception as e:
                 logger.warning(f"Tag-based material augmentation failed: {e}")
 
-        return [material_info.url for material_info in materials]
+        return [material_info.url for material_info in materials], _intermediate_files
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
@@ -315,8 +343,8 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             logger.error(
                 "failed to download videos, maybe the network is not available. if you are in China, please use a VPN."
             )
-            return None
-        return downloaded_videos
+            return None, []
+        return downloaded_videos, []
 
 
 def generate_final_videos(
@@ -449,7 +477,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
     # 5. Get video materials
-    downloaded_videos = get_video_materials(
+    downloaded_videos, _intermediate_files = get_video_materials(
         task_id, params, video_terms, audio_duration
     )
     if not downloaded_videos:
@@ -476,6 +504,20 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     final_video_paths, combined_video_paths = generate_final_videos(
         task_id, params, downloaded_videos, audio_file, subtitle_path
     )
+
+    # --- 清理图片转换产生的中间 mp4 ---
+    # combined-{i}.mp4 已将 material_*.mp4 内容吸收，这些中间文件不再需要。
+    if _intermediate_files:
+        _cleaned = 0
+        for _fp in _intermediate_files:
+            try:
+                if os.path.isfile(_fp):
+                    os.remove(_fp)
+                    _cleaned += 1
+            except OSError:
+                pass
+        if _cleaned > 0:
+            logger.info(f"Cleaned up {_cleaned} intermediate material file(s)")
 
     if not final_video_paths:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)

@@ -471,11 +471,20 @@ def search_materials_by_tags(
             match_detail["events_matched"] = []
 
         # Keyword search in description
+        # Split space-separated keywords into individual tokens and match
+        # each independently. The LLM returns 1-3 space-separated keywords
+        # (e.g. "机会成本 选择 决策"), and matching the whole string as a
+        # single substring would almost never hit any description.
         if keyword:
-            kw = keyword.strip()
-            if kw and kw.lower() in tags.description.lower():
-                score += 2
+            keywords = [k.strip() for k in keyword.split() if k.strip()]
+            matched_keywords = []
+            for kw in keywords:
+                if kw.lower() in tags.description.lower():
+                    matched_keywords.append(kw)
+            if matched_keywords:
+                score += len(matched_keywords)
                 match_detail["keyword_matched"] = True
+                match_detail["keywords_matched"] = matched_keywords
 
         # "all" mode: skip if any specified dimension has zero hits
         if match_mode == "all":

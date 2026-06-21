@@ -93,7 +93,7 @@ class TestCli(unittest.TestCase):
 
         try:
             materials = [MaterialInfo(provider="local", url=test_filename, duration=0)]
-            result = vd.preprocess_video(materials=materials, clip_duration=4)
+            result, _ = vd.preprocess_video(materials=materials, task_id="test-cli", clip_duration=4)
             self.assertTrue(len(result) > 0, "preprocess_video should return valid materials")
             self.assertTrue(
                 os.path.isabs(result[0].url),
