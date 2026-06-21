@@ -25,6 +25,7 @@ from app.models.schema import (
 )
 from app.services import llm, voice
 from app.services import task as tm
+from app.services.script import generate_script_with_template, get_template_manager
 from app.utils import utils
 
 st.set_page_config(
@@ -786,6 +787,28 @@ with left_panel:
         )
         params.video_language = video_languages[selected_index][1]
 
+        # Template selection for two-stage Planner + Writer pipeline
+        template_manager = get_template_manager()
+        available_templates = template_manager.list_templates()
+        template_options = [("", tr("None (Classic Mode)"))]
+        template_options.extend(
+            (t["id"], f"{t['name']} ({t['duration']}s)")
+            for t in available_templates
+        )
+
+        template_selected_index = st.selectbox(
+            tr("Script Template"),
+            index=0,
+            options=range(len(template_options)),
+            format_func=lambda x: template_options[x][1],
+            help=tr(
+                "Select a template to use the two-stage Planner+Writer pipeline. "
+                "Leave empty for classic single-call script generation."
+            ),
+            key="template_select",
+        )
+        params.template_id = template_options[template_selected_index][0]
+
         with st.expander(tr("Advanced Script Settings"), expanded=False):
             params.paragraph_number = st.slider(
                 tr("Script Paragraph Number"),
@@ -823,13 +846,22 @@ with left_panel:
             tr("Generate Video Script and Keywords"), key="auto_generate_script"
         ):
             with st.spinner(tr("Generating Video Script and Keywords")):
-                script = llm.generate_script(
-                    video_subject=params.video_subject,
-                    language=params.video_language,
-                    paragraph_number=params.paragraph_number,
-                    video_script_prompt=params.video_script_prompt,
-                    custom_system_prompt=params.custom_system_prompt,
-                )
+                if params.template_id:
+                    # Two-stage Planner + Writer pipeline
+                    script = generate_script_with_template(
+                        topic=params.video_subject,
+                        template_id=params.template_id,
+                        language=params.video_language,
+                    )
+                else:
+                    # Classic single-call pipeline
+                    script = llm.generate_script(
+                        video_subject=params.video_subject,
+                        language=params.video_language,
+                        paragraph_number=params.paragraph_number,
+                        video_script_prompt=params.video_script_prompt,
+                        custom_system_prompt=params.custom_system_prompt,
+                    )
                 terms = llm.generate_terms(
                     params.video_subject,
                     script,

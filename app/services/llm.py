@@ -118,7 +118,24 @@ def _extract_qwen_generation_text(response) -> str:
     return _normalize_text_response(text, "qwen")
 
 
-def _generate_response(prompt: str) -> str:
+def _build_messages(prompt: str, system_prompt: str = "") -> list:
+    """Build a messages list for OpenAI-compatible chat completions."""
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
+
+def _prepend_system_prompt(prompt: str, system_prompt: str) -> str:
+    """Prepend system prompt to user prompt for providers that don't
+    support the system role natively (e.g. Gemini generate_content)."""
+    if not system_prompt:
+        return prompt
+    return f"{system_prompt}\n\n{prompt}"
+
+
+def _generate_response(prompt: str, system_prompt: str = "") -> str:
     try:
         content = ""
         llm_provider = config.app.get("llm_provider", "openai")
@@ -151,7 +168,7 @@ def _generate_response(prompt: str) -> str:
                 model_name = "gpt-3.5-turbo-16k-0613"
             content = g4f.ChatCompletion.create(
                 model=model_name,
-                messages=[{"role": "user", "content": prompt}],
+                messages=_build_messages(prompt, system_prompt),
             )
         else:
             api_version = ""  # for azure
@@ -285,9 +302,7 @@ def _generate_response(prompt: str) -> str:
                     # Prepare the payload
                     payload = {
                         "model": model_name,
-                        "messages": [
-                            {"role": "user", "content": prompt}
-                        ],
+                        "messages": _build_messages(prompt, system_prompt),
                         "seed": 101  # Optional but helps with reproducibility
                     }
                     
@@ -340,7 +355,8 @@ def _generate_response(prompt: str) -> str:
 
                 dashscope.api_key = api_key
                 response = dashscope.Generation.call(
-                    model=model_name, messages=[{"role": "user", "content": prompt}]
+                    model=model_name,
+                    messages=_build_messages(prompt, system_prompt),
                 )
                 if response:
                     if isinstance(response, GenerationResponse):
@@ -399,7 +415,9 @@ def _generate_response(prompt: str) -> str:
                 )
 
                 try:
-                    response = model.generate_content(prompt)
+                    response = model.generate_content(
+                        _prepend_system_prompt(prompt, system_prompt)
+                    )
                     candidates = response.candidates
                     generated_text = candidates[0].content.parts[0].text
                 except (AttributeError, IndexError) as e:
@@ -417,13 +435,9 @@ def _generate_response(prompt: str) -> str:
                     f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model_name}",
                     headers={"Authorization": f"Bearer {api_key}"},
                     json={
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": "You are a friendly assistant",
-                            },
-                            {"role": "user", "content": prompt},
-                        ]
+                        "messages": _build_messages(
+                            prompt, system_prompt or "You are a friendly assistant"
+                        )
                     },
                 )
                 result = response.json()
@@ -444,7 +458,7 @@ def _generate_response(prompt: str) -> str:
 
                 payload = json.dumps(
                     {
-                        "messages": [{"role": "user", "content": prompt}],
+                        "messages": _build_messages(prompt, system_prompt),
                         "temperature": 0.5,
                         "top_p": 0.8,
                         "penalty_score": 1,
@@ -470,7 +484,7 @@ def _generate_response(prompt: str) -> str:
 
                 response = litellm.completion(
                     model=model_name,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=_build_messages(prompt, system_prompt),
                     drop_params=True,
                 )
 
@@ -493,7 +507,8 @@ def _generate_response(prompt: str) -> str:
                     azure_endpoint=base_url,
                 )
                 response = client.chat.completions.create(
-                    model=model_name, messages=[{"role": "user", "content": prompt}]
+                    model=model_name,
+                    messages=_build_messages(prompt, system_prompt),
                 )
                 if response:
                     if isinstance(response, ChatCompletion):
@@ -516,7 +531,7 @@ def _generate_response(prompt: str) -> str:
                 )
                 response = client.chat.completions.create(
                     model=model_name,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=_build_messages(prompt, system_prompt),
                     extra_body={"enable_thinking": False},
                     stream=True
                 )
@@ -542,7 +557,8 @@ def _generate_response(prompt: str) -> str:
                 )
 
             response = client.chat.completions.create(
-                model=model_name, messages=[{"role": "user", "content": prompt}]
+                model=model_name,
+                messages=_build_messages(prompt, system_prompt),
             )
             if response:
                 if isinstance(response, ChatCompletion):
@@ -1514,6 +1530,40 @@ Return ONLY the JSON array:"""
 
     logger.info(f"Built {len(prompts)} image generation prompts from script")
     return prompts
+
+
+def generate_json_response(prompt: str, system_prompt: str = "") -> str:
+    """Call the LLM and return raw text suitable for JSON parsing.
+
+    This is a public wrapper around ``_generate_response`` used by the
+    two-stage script generation pipeline (Planner).  It returns the raw
+    LLM response without text-normalisation so callers can apply their
+    own JSON parsing and retry logic.
+
+    Returns:
+        Raw LLM response string, or an error string starting with
+        ``"Error: "`` on failure.
+    """
+    return _generate_response(prompt=prompt, system_prompt=system_prompt)
+
+
+def generate_text_response(prompt: str, system_prompt: str = "") -> str:
+    """Call the LLM and return cleaned, readable text.
+
+    This is a public wrapper around ``_generate_response`` used by the
+    two-stage script generation pipeline (Writer).  It normalises the
+    response with the same logic used by the original ``generate_script``
+    path (think-block removal, newline stripping).
+
+    Returns:
+        Normalised text string, or an error string starting with
+        ``"Error: "`` on failure.
+    """
+    raw = _generate_response(prompt=prompt, system_prompt=system_prompt)
+    if raw.startswith("Error:"):
+        return raw
+    llm_provider = config.app.get("llm_provider", "openai")
+    return _normalize_text_response(raw, llm_provider)
 
 
 if __name__ == "__main__":
