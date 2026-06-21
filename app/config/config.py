@@ -166,6 +166,7 @@ def save_config():
         _cfg["siliconflow"] = siliconflow
         _cfg["tagging"] = tagging
         _cfg["ui"] = ui
+        _cfg["image_generation"] = image_generation
         f.write(toml.dumps(_cfg))
 
 
@@ -182,6 +183,7 @@ ui = _cfg.get(
     },
 )
 tagging = _cfg.get("tagging", {})
+image_generation = _cfg.get("image_generation", {})
 
 # Normalize material_directory path: the third-party "toml" library may
 # incorrectly interpret backslash sequences like \v (vertical tab) in Windows

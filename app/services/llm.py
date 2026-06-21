@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import time
 import requests
 from typing import List
 
@@ -1414,6 +1415,105 @@ def get_tag_candidates() -> dict:
         "emotions": _EMOTION_CANDIDATES,
         "events": all_events,
     }
+
+
+def build_image_prompts(
+    video_script: str,
+    video_subject: str = "",
+    max_prompts: int = 8,
+    language: str = "en",
+    style: str = "anime",
+) -> List[str]:
+    """
+    Convert a video narration script into image generation prompts.
+
+    Calls the LLM to analyze each narrative paragraph and generate
+    a detailed visual scene prompt suitable for text-to-image models.
+
+    Args:
+        video_script: Video narration script text
+        video_subject: Video subject (provides additional context)
+        max_prompts: Maximum number of prompts to generate
+        language: Prompt language (en/zh)
+        style: Visual style (anime/realistic/illustration)
+
+    Returns:
+        List of prompt strings in script narrative order
+    """
+    style_guide = {
+        "anime": "Japanese anime style, like Studio Ghibli or Crayon Shin-chan, vibrant colors",
+        "realistic": "photorealistic, cinematic composition, 8K resolution, natural lighting",
+        "illustration": "digital illustration, storybook art style, warm and inviting",
+    }.get(style, "high quality, visually appealing")
+
+    lang_instruction = (
+        "Write prompts in English (best for image generation models)."
+        if language == "en"
+        else "Write prompts in Chinese."
+    )
+
+    prompt = f"""# Role: Visual Scene Description Expert
+
+## Goal
+Given a video narration script, break it into {max_prompts} key visual scenes \
+and write a detailed image generation prompt for each scene.
+
+## Constraints
+1. Return ONLY a valid JSON array of strings. No markdown, no commentary.
+2. Each prompt should describe a complete visual scene: subject, action, \
+setting, mood, colors, composition.
+3. Each prompt should be 1-3 sentences, under 200 characters.
+4. Visual style: {style_guide}
+5. {lang_instruction}
+6. Prompts should be in script narrative order.
+7. Focus on visually concrete elements, not abstract concepts.
+8. Include the main characters/subjects in each prompt where applicable.
+
+## Video Subject
+{video_subject}
+
+## Video Script
+{video_script[:2000]}
+
+## Output Example
+["A young boy with spiky hair sneaking into the kitchen at night, \
+dim warm lighting, anime style",
+ "The boy's mother discovering the empty pudding cup, shocked expression, \
+bright kitchen, anime style"]
+
+Return ONLY the JSON array:"""
+
+    prompts = []
+    for attempt in range(3):
+        try:
+            response = _generate_response(prompt=prompt)
+            if "Error: " in response:
+                logger.error(f"Failed to build image prompts: {response}")
+                continue
+
+            # Parse JSON
+            cleaned = _strip_code_fence(response)
+            try:
+                prompts = json.loads(cleaned)
+            except json.JSONDecodeError:
+                # Try regex extraction
+                match = re.search(r"\[.*\]", cleaned, re.DOTALL)
+                if match:
+                    prompts = json.loads(match.group())
+
+            if isinstance(prompts, list) and all(isinstance(p, str) for p in prompts):
+                break
+        except Exception as e:
+            logger.warning(
+                f"build_image_prompts attempt {attempt + 1} failed: {e}"
+            )
+            time.sleep(0.5)
+
+    # Clamp to max
+    prompts = prompts[:max_prompts]
+
+    logger.info(f"Built {len(prompts)} image generation prompts from script")
+    return prompts
 
 
 if __name__ == "__main__":

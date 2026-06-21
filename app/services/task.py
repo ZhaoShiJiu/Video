@@ -227,33 +227,56 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
                             "Tag-based auto-matching returned no results. "
                             "No relevant tagged images found for this script."
                         )
-                        # --- Fallback: random sampling from material directory ---
-                        # When semantic matching fails (common for abstract scripts
-                        # like "机会成本"), don't fail immediately. Instead, randomly
-                        # pick images from the material directory as a fallback.
-                        _all_images = tagging._find_all_images(_mat_dir)
-                        if _all_images:
-                            from app.models.schema import MaterialInfo
+                        # --- Fallback Chain ---
+                        # Step 1: AI Image Generation (NEW)
+                        # Step 2: Random Sampling (existing)
+                        # Step 3: Error (existing)
+                        from app.models.schema import MaterialInfo
 
-                            _sample_count = min(15, len(_all_images))
-                            _sampled = random.sample(_all_images, _sample_count)
+                        _materials_from_fallback = _try_ai_image_generation_fallback(
+                            script=script,
+                            video_subject=getattr(params, "video_subject", ""),
+                            mat_dir=_mat_dir,
+                        )
+
+                        if _materials_from_fallback:
                             if params.video_materials is None:
                                 params.video_materials = []
-                            for _img in _sampled:
+                            for _fp in _materials_from_fallback:
                                 mi = MaterialInfo()
                                 mi.provider = "local"
-                                mi.url = _img
+                                mi.url = _fp
                                 mi.duration = 0
                                 params.video_materials.append(mi)
                             logger.info(
-                                f"Random fallback: selected {_sample_count} images "
-                                f"from material directory (no semantic match available)"
+                                f"AI image generation fallback: added "
+                                f"{len(_materials_from_fallback)} generated images"
                             )
                         else:
-                            logger.warning(
-                                f"Random fallback failed: no images found in "
-                                f"material directory {_mat_dir!r}"
-                            )
+                            # --- Existing Random Fallback ---
+                            _all_images = tagging._find_all_images(_mat_dir)
+                            if _all_images:
+
+                                _sample_count = min(15, len(_all_images))
+                                _sampled = random.sample(_all_images, _sample_count)
+                                if params.video_materials is None:
+                                    params.video_materials = []
+                                for _img in _sampled:
+                                    mi = MaterialInfo()
+                                    mi.provider = "local"
+                                    mi.url = _img
+                                    mi.duration = 0
+                                    params.video_materials.append(mi)
+                                logger.info(
+                                    f"Random fallback: selected {_sample_count} images "
+                                    f"from material directory (no semantic match available)"
+                                )
+                            else:
+                                logger.warning(
+                                    f"All fallbacks exhausted: no tagged matches, "
+                                    f"AI generation disabled/failed, and no images "
+                                    f"in material directory {_mat_dir!r}"
+                                )
                 else:
                     logger.warning(
                         f"Tag-based auto-matching skipped: "
@@ -401,6 +424,69 @@ def generate_final_videos(
         combined_video_paths.append(combined_video_path)
 
     return final_video_paths, combined_video_paths
+
+
+def _try_ai_image_generation_fallback(
+    script: str,
+    video_subject: str = "",
+    mat_dir: str = "",
+) -> list:
+    """
+    Try to generate images via AI text-to-image as a fallback.
+
+    Returns:
+        List of absolute image file paths, or empty list on failure/disabled.
+    """
+    try:
+        from app.services import image_gen
+    except ImportError:
+        logger.warning("image_gen service not available")
+        return []
+
+    cfg = config.image_generation
+    if not cfg.get("enabled", False):
+        logger.info("AI image generation fallback is disabled in config")
+        return []
+
+    if not script:
+        logger.warning("Cannot generate images: no script text available")
+        return []
+
+    try:
+        # Step 1: Convert script to image prompts
+        max_prompts = int(cfg.get("max_images", 8))
+        style = cfg.get("prompt_style", "anime")
+        language = cfg.get("prompt_language", "en")
+
+        image_prompts = llm.build_image_prompts(
+            video_script=script,
+            video_subject=video_subject,
+            max_prompts=max_prompts,
+            language=language,
+            style=style,
+        )
+
+        if not image_prompts:
+            logger.warning("LLM failed to generate image prompts from script")
+            return []
+
+        logger.info(
+            f"Generated {len(image_prompts)} image prompts from script: "
+            f"{[p[:60] + '...' for p in image_prompts]}"
+        )
+
+        # Step 2: Generate images
+        save_dir = os.path.join(mat_dir, cfg.get("sub_directory", "_ai_generated"))
+        generated_paths = image_gen.generate_images(
+            prompts=image_prompts,
+            save_dir=save_dir,
+        )
+
+        return generated_paths
+
+    except Exception as e:
+        logger.warning(f"AI image generation fallback failed: {e}")
+        return []
 
 
 def start(task_id, params: VideoParams, stop_at: str = "video"):

@@ -1069,6 +1069,82 @@ with middle_panel:
                     except Exception as _tag_exc:
                         st.warning(f"标签筛选暂不可用: {_tag_exc}")
 
+            # --- AI 文生图兜底配置 ---
+            with st.expander("🎨 文生图兜底（标签匹配无结果时自动生成）", expanded=False):
+                _enable_image_gen = st.checkbox(
+                    "启用 AI 文生图兜底",
+                    value=config.image_generation.get("enabled", False),
+                    help="当素材库无匹配图片时，自动调用文生图大模型根据脚本生成图片",
+                    key="enable_image_gen_cb",
+                )
+                config.image_generation["enabled"] = _enable_image_gen
+
+                if _enable_image_gen:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        _img_providers = ["dashscope", "openai", "siliconflow", "stability", "comfyui"]
+                        _current_provider = config.image_generation.get("provider", "dashscope").lower()
+                        _prov_idx = 0
+                        for i, p in enumerate(_img_providers):
+                            if p == _current_provider:
+                                _prov_idx = i
+                                break
+                        _img_provider = st.selectbox(
+                            "文生图 Provider",
+                            options=_img_providers,
+                            index=_prov_idx,
+                            key="img_gen_provider",
+                        )
+                        config.image_generation["provider"] = _img_provider
+
+                        _img_styles = ["anime", "realistic", "illustration", "auto"]
+                        _current_style = config.image_generation.get("prompt_style", "anime")
+                        _style_idx = 0
+                        for i, s in enumerate(_img_styles):
+                            if s == _current_style:
+                                _style_idx = i
+                                break
+                        _img_style = st.selectbox(
+                            "画面风格",
+                            options=_img_styles,
+                            index=_style_idx,
+                            key="img_gen_style",
+                        )
+                        config.image_generation["prompt_style"] = _img_style
+                    with col2:
+                        _img_count = st.slider(
+                            "最大生成张数",
+                            min_value=1,
+                            max_value=20,
+                            value=config.image_generation.get("max_images", 8),
+                            key="img_gen_count",
+                        )
+                        config.image_generation["max_images"] = _img_count
+
+                        _auto_tag = st.checkbox(
+                            "自动打标",
+                            value=config.image_generation.get("auto_tag", True),
+                            help="生成后自动用视觉模型分析并打标签，便于后续复用",
+                            key="img_gen_auto_tag",
+                        )
+                        config.image_generation["auto_tag"] = _auto_tag
+
+                    _custom_style = st.text_input(
+                        "自定义风格描述（追加到每个 Prompt 末尾）",
+                        value=config.image_generation.get("custom_style_prompt", ""),
+                        placeholder="例如：Studio Ghibli style, warm lighting, 16:9 composition",
+                        key="img_gen_custom_style",
+                    )
+                    config.image_generation["custom_style_prompt"] = _custom_style
+
+                    _model_name = st.text_input(
+                        "模型名称",
+                        value=config.image_generation.get("model", "z-image-turbo"),
+                        placeholder="例如：z-image-turbo, dall-e-3",
+                        key="img_gen_model",
+                    )
+                    config.image_generation["model"] = _model_name
+
         selected_index = st.selectbox(
             tr("Video Concat Mode"),
             index=1,

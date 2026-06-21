@@ -498,3 +498,33 @@ class TagStatsResponse(BaseResponse):
                 },
             },
         }
+
+
+###############################################################################
+# AI Image Generation Models
+###############################################################################
+
+
+class ImageGenParams(BaseModel):
+    """Parameters for AI image generation"""
+    prompts: List[str] = Field(..., min_length=1, max_length=20)
+    style: Optional[str] = "anime"
+    image_size: Optional[str] = "1792x1024"
+    max_images: Optional[int] = Field(default=8, ge=1, le=20)
+
+
+class ImageGenResponse(BaseResponse):
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "status": 200,
+                "message": "success",
+                "data": {
+                    "generated_images": [
+                        "/materials/_ai_generated/ai_gen_a1b2c3d4e5f6.png",
+                    ],
+                    "count": 1,
+                    "prompts_used": ["A young boy playing in the park..."],
+                },
+            },
+        }
